@@ -6,6 +6,442 @@ const SSHManager = require('../config/SSHManager');
 
 const router = express.Router();
 
+// --- ROTA POST /start-live - Iniciar transmissão para redes sociais ---
+router.post('/start-live', authMiddleware, async (req, res) => {
+  try {
+    const {
+      tipo,
+      live_servidor,
+      live_chave,
+      inicio_imediato = true,
+      data_inicio,
+      data_fim
+    } = req.body;
+
+    const userId = req.user.id;
+    const userLogin = req.user.usuario || (req.user.email ? req.user.email.split('@')[0] : `user_${userId}`);
+
+    if (!tipo || !live_servidor || !live_chave) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Tipo, servidor e chave são obrigatórios' 
+      });
+    }
+
+    // Validar datas se não for início imediato
+    if (!inicio_imediato) {
+      if (!data_inicio || !data_fim) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Data de início e fim são obrigatórias para transmissões agendadas' 
+        });
+      }
+
+      const dataInicioDate = new Date(data_inicio);
+      const dataFimDate = new Date(data_fim);
+      
+      if (dataFimDate <= dataInicioDate) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Data de fim deve ser posterior à data de início' 
+        });
+      }
+      
+      // Verificar limite de 24 horas
+      const diffHours = (dataFimDate.getTime() - dataInicioDate.getTime()) / (1000 * 60 * 60);
+      if (diffHours > 24) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Tempo máximo de transmissão é 24 horas' 
+        });
+      }
+    }
+
+    // Verificar se já existe transmissão ativa
+    const [activeTransmission] = await db.execute(
+      'SELECT codigo FROM lives WHERE codigo_stm = ? AND status = "1"',
+      [userId]
+    );
+
+    if (activeTransmission.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Já existe uma transmissão ativa. Finalize-a antes de iniciar uma nova.' 
+      });
+    }
+
+    // Extrair servidor e aplicação da URL RTMP
+    const liveServidorClean = live_servidor.replace(/^rtmps?:\/\//, '').split('/')[0];
+    const liveApp = live_servidor.replace(/^rtmps?:\/\//, '').substring(liveServidorClean.length + 1);
+
+    // Inserir transmissão no banco
+    const [result] = await db.execute(
+      `INSERT INTO lives (
+        codigo_stm, data_inicio, data_fim, tipo, live_servidor, live_app, live_chave, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        inicio_imediato ? new Date().toISOString().slice(0, 19).replace('T', ' ') : data_inicio,
+        data_fim || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' '),
+        tipo,
+        liveServidorClean,
+        liveApp,
+        live_chave,
+        inicio_imediato ? '1' : '2' // 1=ativo, 2=agendado
+      ]
+    );
+
+    const liveId = result.insertId;
+
+    if (inicio_imediato) {
+      // Iniciar transmissão imediatamente usando FFmpeg
+      try {
+        const sourceRtmp = `rtmp://stmv1.udicast.com:1935/${userLogin}/${userLogin}`;
+        
+        let ffmpegCommand;
+        
+        if (tipo === 'facebook') {
+          // Facebook usa RTMPS
+          ffmpegCommand = `screen -dmS ${userLogin}_${liveId} bash -c "ffmpeg -re -i ${sourceRtmp} -c:v copy -c:a copy -bsf:a aac_adtstoasc -preset ultrafast -strict experimental -threads 1 -f flv '${live_servidor}/${live_chave}'; exec sh"`;
+        } else if (tipo === 'tiktok' || tipo === 'kwai') {
+          // TikTok e Kwai usam crop 9:16
+          ffmpegCommand = `screen -dmS ${userLogin}_${liveId} bash -c "ffmpeg -re -i ${sourceRtmp} -vf 'crop=ih*(9/16):ih' -crf 21 -r 24 -g 48 -b:v 3000000 -b:a 128k -ar 44100 -acodec aac -vcodec libx264 -preset ultrafast -bufsize '(6.000*3000000)/8' -maxrate 3500000 -threads 1 -f flv '${live_servidor}/${live_chave}'; exec sh"`;
+        } else {
+          // Outras plataformas usam configuração padrão
+          ffmpegCommand = `screen -dmS ${userLogin}_${liveId} bash -c "ffmpeg -re -i ${sourceRtmp} -c:v copy -c:a copy -preset ultrafast -threads 1 -f flv '${live_servidor}/${live_chave}'; exec sh"`;
+        }
+
+        // Buscar servidor do usuário
+        const [serverRows] = await db.execute(
+          'SELECT servidor_id FROM folders WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+        const serverId = serverRows.length > 0 ? serverRows[0].servidor_id : 1;
+
+        // Executar comando via SSH
+        const SSHManager = require('../config/SSHManager');
+        await SSHManager.executeCommand(serverId, ffmpegCommand);
+        
+        console.log(`✅ Transmissão ${tipo} iniciada para usuário ${userLogin} (Live ID: ${liveId})`);
+        
+        // Aguardar 5 segundos e verificar se processo está rodando
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Verificar se processo FFmpeg está rodando
+        let checkCommand;
+        if (tipo === 'facebook' || tipo === 'tiktok' || tipo === 'kwai') {
+          checkCommand = `ps aux | grep ffmpeg | grep rtmp | grep ${userLogin} | grep ${tipo} | wc -l`;
+        } else {
+          checkCommand = `ps aux | grep ffmpeg | grep rtmp | grep ${userLogin} | wc -l`;
+        }
+        
+        const checkResult = await SSHManager.executeCommand(serverId, checkCommand);
+        const processCount = parseInt(checkResult.stdout.trim()) || 0;
+        
+        if (processCount === 0) {
+          // Processo não está rodando, marcar como erro
+          await db.execute(
+            'UPDATE lives SET status = "3" WHERE codigo = ?',
+            [liveId]
+          );
+          
+          return res.status(500).json({
+            success: false,
+            error: 'Erro ao iniciar processo de transmissão. Verifique se os dados estão corretos.'
+          });
+        }
+        
+      } catch (ffmpegError) {
+        console.error('Erro ao iniciar FFmpeg:', ffmpegError);
+        
+        // Marcar como erro no banco
+        await db.execute(
+          'UPDATE lives SET status = "3" WHERE codigo = ?',
+          [liveId]
+        );
+        
+        return res.status(500).json({
+          success: false,
+          error: 'Erro ao iniciar processo de transmissão'
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: inicio_imediato ? 'Transmissão iniciada com sucesso' : 'Transmissão agendada com sucesso',
+      live_id: liveId,
+      live_data: {
+        tipo,
+        servidor: liveServidorClean,
+        app: liveApp,
+        source_rtmp: `rtmp://stmv1.udicast.com:1935/${userLogin}/${userLogin}`,
+        view_url: `http://stmv1.udicast.com:1935/${userLogin}/${userLogin}/playlist.m3u8`
+      }
+    });
+  } catch (error) {
+    console.error('Erro ao iniciar transmissão:', error);
+    res.status(500).json({ success: false, error: 'Erro interno do servidor' });
+  }
+});
+
+// --- ROTA POST /stop-live - Finalizar transmissão ---
+router.post('/stop-live', authMiddleware, async (req, res) => {
+  try {
+    const { live_id } = req.body;
+    const userId = req.user.id;
+    const userLogin = req.user.usuario || (req.user.email ? req.user.email.split('@')[0] : `user_${userId}`);
+
+    if (!live_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'ID da transmissão é obrigatório' 
+      });
+    }
+
+    // Buscar dados da transmissão
+    const [liveRows] = await db.execute(
+      'SELECT * FROM lives WHERE codigo = ? AND codigo_stm = ?',
+      [live_id, userId]
+    );
+
+    if (liveRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Transmissão não encontrada' 
+      });
+    }
+
+    const live = liveRows[0];
+
+    try {
+      // Buscar servidor do usuário
+      const [serverRows] = await db.execute(
+        'SELECT servidor_id FROM folders WHERE user_id = ? LIMIT 1',
+        [userId]
+      );
+      const serverId = serverRows.length > 0 ? serverRows[0].servidor_id : 1;
+
+      const SSHManager = require('../config/SSHManager');
+
+      if (live.tipo === 'facebook' || live.tipo === 'tiktok' || live.tipo === 'kwai') {
+        // Para Facebook, TikTok e Kwai, finalizar screen session
+        const stopCommand = `screen -ls | grep -o '[0-9]*\\.${userLogin}_${live.codigo}\\>' | xargs -I{} screen -X -S {} quit`;
+        await SSHManager.executeCommand(serverId, stopCommand);
+      } else {
+        // Para outras plataformas, usar API do Wowza para disable
+        const liveEntry = `${live.tipo}_${live.codigo}`;
+        
+        // Remover entrada do PushPublishMap.txt
+        const removeMapCommand = `sed -i '/${liveEntry}/d' /usr/local/WowzaStreamingEngine/conf/${userLogin}/PushPublishMap.txt`;
+        await SSHManager.executeCommand(serverId, removeMapCommand);
+        
+        // Aqui você poderia chamar a API do Wowza para disable se necessário
+        // const wowzaResult = await wowzaService.disablePushPublish(userLogin, liveEntry);
+      }
+      
+      console.log(`✅ Transmissão ${live.tipo} finalizada para usuário ${userLogin} (Live ID: ${live_id})`);
+      
+    } catch (stopError) {
+      console.error('Erro ao finalizar processo:', stopError);
+      // Continuar mesmo com erro no processo
+    }
+
+    // Atualizar status no banco
+    await db.execute(
+      'UPDATE lives SET status = "0", data_fim = NOW() WHERE codigo = ?',
+      [live_id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Transmissão finalizada com sucesso'
+    });
+  } catch (error) {
+    console.error('Erro ao finalizar transmissão:', error);
+    res.status(500).json({ success: false, error: 'Erro interno do servidor' });
+  }
+});
+
+// --- ROTA POST /restart-live - Reiniciar transmissão ---
+router.post('/restart-live', authMiddleware, async (req, res) => {
+  try {
+    const { live_id } = req.body;
+    const userId = req.user.id;
+    const userLogin = req.user.usuario || (req.user.email ? req.user.email.split('@')[0] : `user_${userId}`);
+
+    // Buscar dados da transmissão
+    const [liveRows] = await db.execute(
+      'SELECT * FROM lives WHERE codigo = ? AND codigo_stm = ?',
+      [live_id, userId]
+    );
+
+    if (liveRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Transmissão não encontrada' 
+      });
+    }
+
+    const live = liveRows[0];
+
+    // Não permitir reiniciar Facebook, TikTok e Kwai
+    if (live.tipo === 'facebook' || live.tipo === 'tiktok' || live.tipo === 'kwai') {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Reiniciar não é suportado para esta plataforma. Remova e cadastre uma nova.' 
+      });
+    }
+
+    try {
+      // Buscar servidor do usuário
+      const [serverRows] = await db.execute(
+        'SELECT servidor_id FROM folders WHERE user_id = ? LIMIT 1',
+        [userId]
+      );
+      const serverId = serverRows.length > 0 ? serverRows[0].servidor_id : 1;
+
+      const SSHManager = require('../config/SSHManager');
+      const liveEntry = `${live.tipo}_${live.codigo}`;
+      
+      // Recriar entrada no PushPublishMap.txt
+      const liveTarget = `${userLogin}={"entryName":"${liveEntry}", "profile":"rtmp", "application":"${live.live_app.replace('/', '')}", "host":"${live.live_servidor.replace('/', '')}", "streamName":"${live.live_chave}"}`;
+      const addMapCommand = `echo '${liveTarget}' >> /usr/local/WowzaStreamingEngine/conf/${userLogin}/PushPublishMap.txt`;
+      await SSHManager.executeCommand(serverId, addMapCommand);
+      
+      // Aqui você poderia chamar a API do Wowza para restart se necessário
+      // const wowzaResult = await wowzaService.restartPushPublish(userLogin, liveEntry);
+      
+      console.log(`✅ Transmissão ${live.tipo} reiniciada para usuário ${userLogin} (Live ID: ${live_id})`);
+      
+    } catch (restartError) {
+      console.error('Erro ao reiniciar processo:', restartError);
+      
+      // Marcar como erro
+      await db.execute(
+        'UPDATE lives SET status = "3" WHERE codigo = ?',
+        [live_id]
+      );
+      
+      return res.status(500).json({
+        success: false,
+        error: 'Erro ao reiniciar transmissão'
+      });
+    }
+
+    // Atualizar status no banco
+    await db.execute(
+      'UPDATE lives SET status = "1", data_inicio = NOW() WHERE codigo = ?',
+      [live_id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Transmissão reiniciada com sucesso'
+    });
+  } catch (error) {
+    console.error('Erro ao reiniciar transmissão:', error);
+    res.status(500).json({ success: false, error: 'Erro interno do servidor' });
+  }
+});
+
+// --- ROTA DELETE /remove-live/:id - Remover transmissão ---
+router.delete('/remove-live/:id', authMiddleware, async (req, res) => {
+  try {
+    const liveId = req.params.id;
+    const userId = req.user.id;
+    const userLogin = req.user.usuario || (req.user.email ? req.user.email.split('@')[0] : `user_${userId}`);
+
+    // Buscar dados da transmissão
+    const [liveRows] = await db.execute(
+      'SELECT * FROM lives WHERE codigo = ? AND codigo_stm = ?',
+      [liveId, userId]
+    );
+
+    if (liveRows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Transmissão não encontrada' 
+      });
+    }
+
+    const live = liveRows[0];
+
+    try {
+      // Buscar servidor do usuário
+      const [serverRows] = await db.execute(
+        'SELECT servidor_id FROM folders WHERE user_id = ? LIMIT 1',
+        [userId]
+      );
+      const serverId = serverRows.length > 0 ? serverRows[0].servidor_id : 1;
+
+      const SSHManager = require('../config/SSHManager');
+
+      if (live.tipo === 'facebook' || live.tipo === 'tiktok' || live.tipo === 'kwai') {
+        // Finalizar screen session
+        const stopCommand = `screen -ls | grep -o '[0-9]*\\.${userLogin}_${live.codigo}\\>' | xargs -I{} screen -X -S {} quit`;
+        await SSHManager.executeCommand(serverId, stopCommand);
+      } else {
+        // Remover entrada do PushPublishMap.txt
+        const liveEntry = `${live.tipo}_${live.codigo}`;
+        const removeMapCommand = `sed -i '/${liveEntry}/d' /usr/local/WowzaStreamingEngine/conf/${userLogin}/PushPublishMap.txt`;
+        await SSHManager.executeCommand(serverId, removeMapCommand);
+      }
+      
+      console.log(`✅ Transmissão ${live.tipo} removida para usuário ${userLogin} (Live ID: ${liveId})`);
+      
+    } catch (removeError) {
+      console.error('Erro ao remover processo:', removeError);
+      // Continuar mesmo com erro no processo
+    }
+
+    // Remover do banco
+    await db.execute(
+      'DELETE FROM lives WHERE codigo = ?',
+      [liveId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Transmissão removida com sucesso'
+    });
+  } catch (error) {
+    console.error('Erro ao remover transmissão:', error);
+    res.status(500).json({ success: false, error: 'Erro interno do servidor' });
+  }
+});
+
+// --- ROTA GET /lives - Listar transmissões do usuário ---
+router.get('/lives', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const [rows] = await db.execute(
+      `SELECT 
+        codigo as id,
+        tipo,
+        live_servidor,
+        live_app,
+        live_chave,
+        data_inicio,
+        data_fim,
+        status
+       FROM lives 
+       WHERE codigo_stm = ?
+       ORDER BY data_inicio DESC`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      lives: rows
+    });
+  } catch (error) {
+    console.error('Erro ao listar transmissões:', error);
+    res.status(500).json({ success: false, error: 'Erro interno do servidor' });
+  }
+});
+
 // --- ROTA GET /obs-config - Configuração para OBS ---
 router.get('/obs-config', authMiddleware, async (req, res) => {
   try {
@@ -99,7 +535,7 @@ router.get('/obs-config', authMiddleware, async (req, res) => {
     }
 
     // Configurar URLs baseadas no ambiente
-    // SEMPRE usar domínio do servidor Wowza, NUNCA o domínio da aplicação
+    // SEMPRE usar domínio do Wowza conforme especificado
     const wowzaHost = 'stmv1.udicast.com';
     
     // Resposta final
@@ -108,14 +544,17 @@ router.get('/obs-config', authMiddleware, async (req, res) => {
       obs_config: {
         rtmp_url: `rtmp://${wowzaHost}:1935/${userLogin}`,
         stream_key: `${userLogin}_live`,
-        hls_url: `http://${wowzaHost}:80/${userLogin}/${userLogin}_live/playlist.m3u8`,
+        hls_url: `http://${wowzaHost}:1935/${userLogin}/${userLogin}_live/playlist.m3u8`,
         hls_secure_url: `https://${wowzaHost}:443/${userLogin}/${userLogin}_live/playlist.m3u8`,
-        dash_url: `http://${wowzaHost}:80/${userLogin}/${userLogin}_live/manifest.mpd`,
+        dash_url: `http://${wowzaHost}:1935/${userLogin}/${userLogin}_live/manifest.mpd`,
         rtsp_url: `rtsp://${wowzaHost}:554/${userLogin}/${userLogin}_live`,
         max_bitrate: allowedBitrate,
         max_viewers: userConfig.espectadores,
         recording_enabled: userConfig.status_gravando === 'sim',
-        recording_path: `/home/streaming/${userLogin}/recordings/`
+        recording_path: `/home/streaming/${userLogin}/recordings/`,
+        // URLs para transmissão de lives (fonte)
+        source_rtmp: `rtmp://${wowzaHost}:1935/${userLogin}/${userLogin}`,
+        live_view_url: `http://${wowzaHost}:1935/${userLogin}/${userLogin}/playlist.m3u8`
       },
       user_limits: {
         bitrate: {
@@ -134,7 +573,8 @@ router.get('/obs-config', authMiddleware, async (req, res) => {
         }
       },
       warnings: warnings,
-      server_info: serverInfo
+      server_info: serverInfo,
+      wowza_domain: wowzaHost
     });
 
   } catch (error) {

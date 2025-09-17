@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { ChevronLeft, Radio, Play, Square, Settings, Upload, Eye, EyeOff, Plus, Trash2, Save, AlertCircle, CheckCircle, Activity, Users, Zap, Clock } from 'lucide-react';
+import { ChevronLeft, Radio, Play, Square, Settings, Upload, Eye, EyeOff, Plus, Trash2, Save, AlertCircle, CheckCircle, Activity, Users, Zap, Clock, Calendar, Wifi } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { useAuth } from '../../context/AuthContext';
 import { useStream } from '../../context/StreamContext';
-import UniversalVideoPlayer from '../../components/UniversalVideoPlayer';
+import IFrameVideoPlayer from '../../components/IFrameVideoPlayer';
 
 interface Platform {
   id: string;
@@ -12,12 +12,6 @@ interface Platform {
   codigo: string;
   rtmp_base_url: string;
   requer_stream_key: boolean;
-}
-
-interface PlatformResult {
-  platform: string;
-  success: boolean;
-  error?: string;
 }
 
 interface UserPlatform {
@@ -29,6 +23,18 @@ interface UserPlatform {
   descricao_padrao: string;
   ativo: boolean;
   platform: Platform;
+}
+
+interface LiveTransmission {
+  id: number;
+  tipo: string;
+  live_servidor: string;
+  live_app: string;
+  live_chave: string;
+  data_inicio: string;
+  data_fim: string;
+  status: '0' | '1' | '2' | '3'; // 0=finalizado, 1=transmitindo, 2=agendado, 3=erro
+  duracao?: string;
 }
 
 interface Playlist {
@@ -46,16 +52,15 @@ interface Logo {
   tipo_arquivo: string;
 }
 
-interface TransmissionSettings {
+interface LiveTransmissionSettings {
   titulo: string;
   descricao: string;
-  playlist_id: string;
-  platform_ids: string[];
-  bitrate_override?: number;
-  enable_recording: boolean;
-  logo_id?: string;
-  logo_position: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
-  logo_opacity: number;
+  tipo: string;
+  live_servidor: string;
+  live_chave: string;
+  inicio_imediato: boolean;
+  data_inicio?: string;
+  data_fim?: string;
 }
 
 interface StreamStatus {
@@ -91,49 +96,41 @@ const IniciarTransmissao: React.FC = () => {
   const { getToken, user } = useAuth();
   const { streamData, refreshStreamStatus } = useStream();
 
-  const [platforms, setPlatforms] = useState<Platform[]>([]);
-  const [userPlatforms, setUserPlatforms] = useState<UserPlatform[]>([]);
-  const [playlists, setPlaylists] = useState<Playlist[]>([]);
-  const [logos, setLogos] = useState<Logo[]>([]);
+  const [liveTransmissions, setLiveTransmissions] = useState<LiveTransmission[]>([]);
   const [streamStatus, setStreamStatus] = useState<StreamStatus | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [showPlatformModal, setShowPlatformModal] = useState(false);
-  const [showLogoUpload, setShowLogoUpload] = useState(false);
+  const [showLiveModal, setShowLiveModal] = useState(false);
+  const [showPlayerModal, setShowPlayerModal] = useState(false);
 
-  const [settings, setSettings] = useState<TransmissionSettings>({
+  const [liveSettings, setLiveSettings] = useState<LiveTransmissionSettings>({
     titulo: '',
     descricao: '',
-    playlist_id: '',
-    platform_ids: [],
-    enable_recording: false,
-    loop_playlist: false,
-    playlist_finalizacao_id: '',
-    logo_id: '',
-    logo_position: 'top-right',
-    logo_opacity: 80
+    tipo: 'youtube',
+    live_servidor: 'rtmp://a.rtmp.youtube.com/live2',
+    live_chave: '',
+    inicio_imediato: true,
+    data_inicio: '',
+    data_fim: ''
   });
 
-  const [platformForm, setPlatformForm] = useState({
-    platform_id: '',
-    stream_key: '',
-    rtmp_url: '',
-    titulo_padrao: '',
-    descricao_padrao: ''
-  });
+  const [playerUrl, setPlayerUrl] = useState('');
 
-  const [logoUpload, setLogoUpload] = useState<{
-    file: File | null;
-    nome: string;
-    uploading: boolean;
-  }>({
-    file: null,
-    nome: '',
-    uploading: false
-  });
+  // Plataformas disponíveis baseadas no PHP
+  const availablePlatforms = [
+    { id: 'youtube', nome: 'YouTube', rtmp_url: 'rtmp://a.rtmp.youtube.com/live2' },
+    { id: 'facebook', nome: 'Facebook', rtmp_url: 'rtmps://live-api-s.facebook.com:443/rtmp' },
+    { id: 'twitch', nome: 'Twitch', rtmp_url: 'rtmp://live-dfw.twitch.tv/app' },
+    { id: 'periscope', nome: 'Periscope', rtmp_url: 'rtmp://ca.pscp.tv:80/x' },
+    { id: 'vimeo', nome: 'Vimeo', rtmp_url: 'rtmp://rtmp.cloud.vimeo.com/live' },
+    { id: 'steam', nome: 'Steam Valve', rtmp_url: 'rtmp://ingest-any-ord1.broadcast.steamcontent.com/app' },
+    { id: 'tiktok', nome: 'TikTok', rtmp_url: 'rtmp://...' },
+    { id: 'kwai', nome: 'Kwai', rtmp_url: 'rtmp://...' },
+    { id: 'custom', nome: 'RTMP Próprio/Custom', rtmp_url: 'rtmp://...' }
+  ];
 
   useEffect(() => {
-    loadInitialData();
+    loadLiveTransmissions();
     checkStreamStatus();
 
     // Atualizar status a cada 30 segundos
@@ -141,72 +138,19 @@ const IniciarTransmissao: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const loadInitialData = async () => {
-    try {
-      await Promise.all([
-        loadPlatforms(),
-        loadUserPlatforms(),
-        loadPlaylists(),
-        loadLogos()
-      ]);
-    } catch (error) {
-      console.error('Erro ao carregar dados:', error);
-    }
-  };
-
-  const loadPlatforms = async () => {
+  const loadLiveTransmissions = async () => {
     try {
       const token = await getToken();
-      const response = await fetch('/api/streaming/platforms', {
+      const response = await fetch('/api/streaming/lives', {
         headers: { Authorization: `Bearer ${token}` }
       });
-      const data = await response.json();
-      if (data.success) {
-        setPlatforms(data.platforms);
+      
+      if (response.ok) {
+        const data = await response.json();
+        setLiveTransmissions(data.lives || []);
       }
     } catch (error) {
-      console.error('Erro ao carregar plataformas:', error);
-    }
-  };
-
-  const loadUserPlatforms = async () => {
-    try {
-      const token = await getToken();
-      const response = await fetch('/api/streaming/user-platforms', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await response.json();
-      if (data.success) {
-        setUserPlatforms(data.platforms);
-      }
-    } catch (error) {
-      console.error('Erro ao carregar plataformas do usuário:', error);
-    }
-  };
-
-  const loadPlaylists = async () => {
-    try {
-      const token = await getToken();
-      const response = await fetch('/api/playlists', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await response.json();
-      setPlaylists(data);
-    } catch (error) {
-      console.error('Erro ao carregar playlists:', error);
-    }
-  };
-
-  const loadLogos = async () => {
-    try {
-      const token = await getToken();
-      const response = await fetch('/api/logos', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await response.json();
-      setLogos(data);
-    } catch (error) {
-      console.error('Erro ao carregar logos:', error);
+      console.error('Erro ao carregar transmissões:', error);
     }
   };
 
@@ -221,97 +165,133 @@ const IniciarTransmissao: React.FC = () => {
 
       // Atualizar contexto de stream
       refreshStreamStatus();
+      
+      // Se há transmissão ativa, configurar player
+      if (data.is_live) {
+        const baseUrl = process.env.NODE_ENV === 'production' 
+          ? 'http://samhost.wcore.com.br:3001'
+          : 'http://localhost:3001';
+        
+        if (data.stream_type === 'obs') {
+          setPlayerUrl(`${baseUrl}/api/player-port/iframe?login=${userLogin}&stream=${userLogin}_live&player=1&contador=true`);
+        } else if (data.transmission) {
+          setPlayerUrl(`${baseUrl}/api/player-port/iframe?login=${userLogin}&playlist=${data.transmission.codigo_playlist}&player=1&contador=true`);
+        }
+      }
     } catch (error) {
       console.error('Erro ao verificar status:', error);
     }
   };
 
-  const handleStartTransmission = async () => {
-    if (!settings.titulo || !settings.playlist_id) {
-      toast.error('Título e playlist são obrigatórios');
-      return;
-    }
-
-    if (settings.platform_ids.length === 0) {
-      toast.error('Selecione pelo menos uma plataforma');
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const token = await getToken();
-      const response = await fetch('/api/streaming/start', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify(settings)
-      });
-
-      const result = await response.json();
-
-      if (result.success) {
-        toast.success('Transmissão iniciada com sucesso!');
-
-        // Mostrar detalhes do resultado
-        if (result.platform_results) {
-          const platformResults: PlatformResult[] = result.platform_results;
-
-          const successCount = platformResults.filter((p) => p.success).length;
-          const totalCount = platformResults.length;
-
-          if (successCount === totalCount) {
-            toast.success(`Todas as ${totalCount} plataforma(s) conectadas com sucesso!`);
-          } else {
-            toast.warning(`${successCount} de ${totalCount} plataforma(s) conectadas. Verifique as configurações.`);
-
-            platformResults.forEach((platform) => {
-              if (!platform.success) {
-                console.error(`Erro na plataforma ${platform.platform}:`, platform.error);
-              }
-            });
-          }
-        }
-
-        checkStreamStatus();
-
-        // Reset form
-        setSettings(prev => ({
-          ...prev,
-          titulo: '',
-          descricao: '',
-          platform_ids: []
-        }));
-      } else {
-        toast.error(result.error || 'Erro ao iniciar transmissão');
-
-        // Log detalhado do erro
-        console.error('Erro detalhado na transmissão:', result);
-      }
-    } catch (error) {
-      console.error('Erro ao iniciar transmissão:', error);
-      toast.error('Erro ao iniciar transmissão');
-    } finally {
-      setLoading(false);
+  const handlePlatformChange = (tipo: string) => {
+    const platform = availablePlatforms.find(p => p.id === tipo);
+    if (platform) {
+      setLiveSettings(prev => ({
+        ...prev,
+        tipo,
+        live_servidor: platform.rtmp_url
+      }));
     }
   };
 
-  const handleStopTransmission = async () => {
-    if (!confirm('Deseja realmente finalizar a transmissão?')) return;
+  const handleStartLiveTransmission = async () => {
+    if (!liveSettings.live_chave) {
+      toast.error('Chave de transmissão é obrigatória');
+      return;
+    }
+
+    if (!liveSettings.live_servidor) {
+      toast.error('Servidor RTMP é obrigatório');
+      return;
+    }
+
+    // Validar datas se não for início imediato
+    if (!liveSettings.inicio_imediato) {
+      if (!liveSettings.data_inicio || !liveSettings.data_fim) {
+        toast.error('Data de início e fim são obrigatórias para transmissões agendadas');
+        return;
+      }
+      
+      const dataInicio = new Date(liveSettings.data_inicio);
+      const dataFim = new Date(liveSettings.data_fim);
+      
+      if (dataFim <= dataInicio) {
+        toast.error('Data de fim deve ser posterior à data de início');
+        return;
+      }
+      
+      // Verificar limite de 24 horas
+      const diffHours = (dataFim.getTime() - dataInicio.getTime()) / (1000 * 60 * 60);
+      if (diffHours > 24) {
+        toast.error('Tempo máximo de transmissão é 24 horas');
+        return;
+      }
+    }
 
     setLoading(true);
     try {
       const token = await getToken();
-      const response = await fetch('/api/streaming/stop', {
+      const response = await fetch('/api/streaming/start-live', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          transmission_id: streamStatus?.transmission?.id,
-          stream_type: streamStatus?.stream_type || 'playlist'
+          ...liveSettings,
+          // Converter datas para formato do banco
+          data_inicio: liveSettings.data_inicio ? 
+            new Date(liveSettings.data_inicio).toISOString().slice(0, 19).replace('T', ' ') : null,
+          data_fim: liveSettings.data_fim ? 
+            new Date(liveSettings.data_fim).toISOString().slice(0, 19).replace('T', ' ') : null
+        })
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        if (liveSettings.inicio_imediato) {
+          toast.success(`Transmissão para ${liveSettings.tipo} iniciada com sucesso!`);
+        } else {
+          toast.success(`Transmissão para ${liveSettings.tipo} agendada com sucesso!`);
+        }
+
+        loadLiveTransmissions();
+        checkStreamStatus();
+        setShowLiveModal(false);
+
+        // Reset form
+        setLiveSettings(prev => ({
+          ...prev,
+          live_chave: '',
+          data_inicio: '',
+          data_fim: ''
+        }));
+      } else {
+        toast.error(result.error || 'Erro ao configurar transmissão');
+      }
+    } catch (error) {
+      console.error('Erro ao configurar transmissão:', error);
+      toast.error('Erro ao configurar transmissão');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStopLiveTransmission = async (liveId: number) => {
+    if (!confirm('Deseja realmente finalizar esta transmissão?')) return;
+
+    setLoading(true);
+    try {
+      const token = await getToken();
+      const response = await fetch('/api/streaming/stop-live', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          live_id: liveId
         })
       });
 
@@ -319,6 +299,7 @@ const IniciarTransmissao: React.FC = () => {
 
       if (result.success) {
         toast.success('Transmissão finalizada com sucesso!');
+        loadLiveTransmissions();
         checkStreamStatus();
       } else {
         toast.error(result.error || 'Erro ao finalizar transmissão');
@@ -331,51 +312,44 @@ const IniciarTransmissao: React.FC = () => {
     }
   };
 
-  const handleConfigurePlatform = async () => {
-    if (!platformForm.platform_id || !platformForm.stream_key) {
-      toast.error('Plataforma e chave de transmissão são obrigatórios');
-      return;
-    }
+  const handleRestartLiveTransmission = async (liveId: number) => {
+    if (!confirm('Deseja reiniciar esta transmissão?')) return;
 
+    setLoading(true);
     try {
       const token = await getToken();
-      const response = await fetch('/api/streaming/configure-platform', {
+      const response = await fetch('/api/streaming/restart-live', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify(platformForm)
+        body: JSON.stringify({ live_id: liveId })
       });
 
       const result = await response.json();
 
       if (result.success) {
-        toast.success('Plataforma configurada com sucesso!');
-        setShowPlatformModal(false);
-        setPlatformForm({
-          platform_id: '',
-          stream_key: '',
-          rtmp_url: '',
-          titulo_padrao: '',
-          descricao_padrao: ''
-        });
-        loadUserPlatforms();
+        toast.success('Transmissão reiniciada com sucesso!');
+        loadLiveTransmissions();
+        checkStreamStatus();
       } else {
-        toast.error(result.error || 'Erro ao configurar plataforma');
+        toast.error(result.error || 'Erro ao reiniciar transmissão');
       }
     } catch (error) {
-      console.error('Erro ao configurar plataforma:', error);
-      toast.error('Erro ao configurar plataforma');
+      console.error('Erro ao reiniciar transmissão:', error);
+      toast.error('Erro ao reiniciar transmissão');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleRemovePlatform = async (platformId: number) => {
-    if (!confirm('Deseja remover esta plataforma?')) return;
+  const handleRemoveLiveTransmission = async (liveId: number) => {
+    if (!confirm('Deseja remover esta transmissão?')) return;
 
     try {
       const token = await getToken();
-      const response = await fetch(`/api/streaming/user-platforms/${platformId}`, {
+      const response = await fetch(`/api/streaming/remove-live/${liveId}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -383,66 +357,64 @@ const IniciarTransmissao: React.FC = () => {
       const result = await response.json();
 
       if (result.success) {
-        toast.success('Plataforma removida com sucesso!');
-        loadUserPlatforms();
+        toast.success('Transmissão removida com sucesso!');
+        loadLiveTransmissions();
       } else {
-        toast.error(result.error || 'Erro ao remover plataforma');
+        toast.error(result.error || 'Erro ao remover transmissão');
       }
     } catch (error) {
-      console.error('Erro ao remover plataforma:', error);
-      toast.error('Erro ao remover plataforma');
+      console.error('Erro ao remover transmissão:', error);
+      toast.error('Erro ao remover transmissão');
     }
   };
 
-  const handleLogoUpload = async () => {
-    if (!logoUpload.file || !logoUpload.nome) {
-      toast.error('Selecione um arquivo e digite um nome');
-      return;
-    }
-
-    setLogoUpload(prev => ({ ...prev, uploading: true }));
-    try {
-      const token = await getToken();
-      const formData = new FormData();
-      formData.append('logo', logoUpload.file);
-      formData.append('nome', logoUpload.nome);
-
-      const response = await fetch('/api/logos', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData
-      });
-
-      const result = await response.json();
-
-      if (response.ok) {
-        toast.success('Logo enviada com sucesso!');
-        setShowLogoUpload(false);
-        setLogoUpload({ file: null, nome: '', uploading: false });
-        loadLogos();
-      } else {
-        toast.error(result.error || 'Erro ao enviar logo');
-      }
-    } catch (error) {
-      console.error('Erro ao enviar logo:', error);
-      toast.error('Erro ao enviar logo');
-    } finally {
-      setLogoUpload(prev => ({ ...prev, uploading: false }));
+  const getStatusText = (status: string) => {
+    switch (status) {
+      case '1': return 'Transmitindo/Live';
+      case '2': return 'Agendado/Scheduled';
+      case '3': return 'Erro';
+      default: return 'Finalizado/Finished';
     }
   };
 
-  const togglePlatformSelection = (platformId: string) => {
-    setSettings(prev => ({
-      ...prev,
-      platform_ids: prev.platform_ids.includes(platformId)
-        ? prev.platform_ids.filter(id => id !== platformId)
-        : [...prev.platform_ids, platformId]
-    }));
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case '1': return 'bg-green-100 text-green-800';
+      case '2': return 'bg-blue-100 text-blue-800';
+      case '3': return 'bg-red-100 text-red-800';
+      default: return 'bg-gray-100 text-gray-800';
+    }
   };
 
-  const isTransmissionActive = streamStatus?.is_live;
-  const hasOBSStream = streamStatus?.obs_stream?.is_live;
-  const hasPlaylistStream = streamStatus?.transmission;
+  const formatDateTime = (dateString: string) => {
+    if (!dateString) return 'N/A';
+    return new Date(dateString).toLocaleString('pt-BR');
+  };
+
+  const calculateDuration = (live: LiveTransmission) => {
+    if (live.status === '1') {
+      // Transmitindo - calcular duração desde o início
+      const inicio = new Date(live.data_inicio);
+      const agora = new Date();
+      const diffMs = agora.getTime() - inicio.getTime();
+      const hours = Math.floor(diffMs / (1000 * 60 * 60));
+      const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((diffMs % (1000 * 60)) / 1000);
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    } else if (live.status === '0' && live.data_inicio && live.data_fim) {
+      // Finalizado - calcular duração total
+      const inicio = new Date(live.data_inicio);
+      const fim = new Date(live.data_fim);
+      const diffMs = fim.getTime() - inicio.getTime();
+      const hours = Math.floor(diffMs / (1000 * 60 * 60));
+      const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:00`;
+    }
+    return '00:00:00';
+  };
+
+  const activeLiveTransmissions = liveTransmissions.filter(live => live.status === '1');
+  const hasActiveLive = activeLiveTransmissions.length > 0;
 
   return (
     <div className="space-y-6">
@@ -455,424 +427,192 @@ const IniciarTransmissao: React.FC = () => {
 
       <div className="flex items-center space-x-3">
         <Radio className="h-8 w-8 text-primary-600" />
-        <h1 className="text-3xl font-bold text-gray-900">Iniciar Transmissão</h1>
+        <h1 className="text-3xl font-bold text-gray-900">Gerenciamento de Lives</h1>
       </div>
 
-      {/* Status da Transmissão Ativa */}
-      {isTransmissionActive && (
-        <div className="bg-green-50 border border-green-200 rounded-lg p-6">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center">
-              <div className="h-3 w-3 bg-red-500 rounded-full animate-pulse mr-3"></div>
-              <h2 className="text-lg font-semibold text-green-800">
-                {hasOBSStream && hasPlaylistStream ? 'MÚLTIPLAS TRANSMISSÕES ATIVAS' :
-                  hasOBSStream ? 'TRANSMISSÃO OBS ATIVA' :
-                    'TRANSMISSÃO DE PLAYLIST ATIVA'}
-              </h2>
-            </div>
-            <button
-              onClick={handleStopTransmission}
-              disabled={loading}
-              className="bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 disabled:opacity-50 flex items-center"
-            >
-              <Square className="h-4 w-4 mr-2" />
-              {loading ? 'Finalizando...' : 'Finalizar Transmissão'}
-            </button>
-          </div>
-
-          {/* Estatísticas da Transmissão */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            {hasPlaylistStream && (
-              <>
-                <div className="bg-white p-4 rounded-md">
-                  <div className="flex items-center">
-                    <Users className="h-5 w-5 text-blue-600 mr-2" />
-                    <div>
-                      <p className="text-sm text-gray-600">Espectadores (Playlist)</p>
-                      <p className="text-xl font-bold">{streamStatus.transmission?.stats.viewers || 0}</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-white p-4 rounded-md">
-                  <div className="flex items-center">
-                    <Zap className="h-5 w-5 text-green-600 mr-2" />
-                    <div>
-                      <p className="text-sm text-gray-600">Bitrate (Playlist)</p>
-                      <p className="text-xl font-bold">{streamStatus.transmission?.stats.bitrate || 0} kbps</p>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-
-            {hasOBSStream && (
-              <>
-                <div className="bg-white p-4 rounded-md">
-                  <div className="flex items-center">
-                    <Users className="h-5 w-5 text-purple-600 mr-2" />
-                    <div>
-                      <p className="text-sm text-gray-600">Espectadores (OBS)</p>
-                      <p className="text-xl font-bold">{streamStatus.obs_stream?.viewers || 0}</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="bg-white p-4 rounded-md">
-                  <div className="flex items-center">
-                    <Activity className="h-5 w-5 text-orange-600 mr-2" />
-                    <div>
-                      <p className="text-sm text-gray-600">Bitrate (OBS)</p>
-                      <p className="text-xl font-bold">{streamStatus.obs_stream?.bitrate || 0} kbps</p>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-
-            <div className="bg-white p-4 rounded-md">
-              <div className="flex items-center">
-                <Clock className="h-5 w-5 text-purple-600 mr-2" />
-                <div>
-                  <p className="text-sm text-gray-600">Tempo Ativo</p>
-                  <p className="text-xl font-bold">
-                    {hasPlaylistStream ? streamStatus.transmission?.stats.uptime :
-                      hasOBSStream ? streamStatus.obs_stream?.uptime : '00:00:00'}
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Plataformas Conectadas */}
-          {(streamStatus.transmission?.platforms || streamStatus.obs_stream?.platforms) && (
-            <div className="mt-4">
-              <h3 className="text-sm font-medium text-green-800 mb-2">Plataformas Conectadas:</h3>
-              <div className="flex flex-wrap gap-2">
-                {streamStatus.transmission?.platforms?.map((platform, index) => (
-                  <span key={index} className="bg-green-100 text-green-800 text-xs font-medium px-2.5 py-0.5 rounded">
-                    {platform.user_platform.platform.nome} (Playlist)
-                  </span>
-                ))}
-                {streamStatus.obs_stream?.platforms?.map((platform, index) => (
-                  <span key={`obs-${index}`} className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded">
-                    {platform.name || 'OBS'} (OBS)
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Formulário de Configuração */}
-      {!isTransmissionActive && (
-        <div className="bg-white rounded-lg shadow-sm p-6">
-          <h2 className="text-xl font-semibold text-gray-800 mb-6">Configurar Nova Transmissão</h2>
-
-          <div className="space-y-6">
-            {/* Informações Básicas */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <label htmlFor="titulo" className="block text-sm font-medium text-gray-700 mb-2">
-                  Título da Transmissão *
-                </label>
-                <input
-                  id="titulo"
-                  type="text"
-                  value={settings.titulo}
-                  onChange={(e) => setSettings(prev => ({ ...prev, titulo: e.target.value }))}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder="Digite o título da transmissão"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="playlist" className="block text-sm font-medium text-gray-700 mb-2">
-                  Playlist *
-                </label>
-                <select
-                  id="playlist"
-                  value={settings.playlist_id}
-                  onChange={(e) => setSettings(prev => ({ ...prev, playlist_id: e.target.value }))}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                >
-                  <option value="">Selecione uma playlist</option>
-                  {playlists.map((playlist) => (
-                    <option key={playlist.id} value={playlist.id}>
-                      {playlist.nome} ({playlist.total_videos || 0} vídeos)
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div>
-              <label htmlFor="descricao" className="block text-sm font-medium text-gray-700 mb-2">
-                Descrição
-              </label>
-              <textarea
-                id="descricao"
-                value={settings.descricao}
-                onChange={(e) => setSettings(prev => ({ ...prev, descricao: e.target.value }))}
-                rows={3}
-                className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                placeholder="Descrição da transmissão (opcional)"
-              />
-            </div>
-
-            {/* Configurações Avançadas */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div>
-                <label htmlFor="bitrate" className="block text-sm font-medium text-gray-700 mb-2">
-                  Bitrate (kbps)
-                </label>
-                <input
-                  id="bitrate"
-                  type="number"
-                  min="500"
-                  max={user?.bitrate || 5000}
-                  value={settings.bitrate_override || ''}
-                  onChange={(e) => setSettings(prev => ({ ...prev, bitrate_override: parseInt(e.target.value) || undefined }))}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder={`Padrão: ${user?.bitrate || 2500}`}
-                />
-                <p className="text-xs text-gray-500 mt-1">Máximo: {user?.bitrate || 2500} kbps</p>
-              </div>
-
-              <div>
-                <label htmlFor="logo" className="block text-sm font-medium text-gray-700 mb-2">
-                  Logo/Marca d'água
-                </label>
-                <select
-                  id="logo"
-                  value={settings.logo_id || ''}
-                  onChange={(e) => setSettings(prev => ({ ...prev, logo_id: e.target.value }))}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                >
-                  <option value="">Sem logo</option>
-                  {logos.map((logo) => (
-                    <option key={logo.id} value={logo.id}>
-                      {logo.nome}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex items-center">
-                <input
-                  id="recording"
-                  type="checkbox"
-                  checked={settings.enable_recording}
-                  onChange={(e) => setSettings(prev => ({ ...prev, enable_recording: e.target.checked }))}
-                  className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                />
-                <label htmlFor="recording" className="ml-3 text-sm text-gray-700">
-                  Habilitar gravação
-                </label>
-              </div>
-
-              <div className="flex items-center">
-                <input
-                  id="loop"
-                  type="checkbox"
-                  checked={settings.loop_playlist}
-                  onChange={(e) => setSettings(prev => ({ ...prev, loop_playlist: e.target.checked }))}
-                  className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
-                />
-                <label htmlFor="loop" className="ml-3 text-sm text-gray-700">
-                  Repetir playlist em loop
-                </label>
-              </div>
-            </div>
-
-            {/* Playlist de Finalização */}
-            <div>
-              <label htmlFor="playlist-finalizacao" className="block text-sm font-medium text-gray-700 mb-2">
-                Playlist de Finalização (Opcional)
-              </label>
-              <select
-                id="playlist-finalizacao"
-                value={settings.playlist_finalizacao_id}
-                onChange={(e) => setSettings(prev => ({ ...prev, playlist_finalizacao_id: e.target.value }))}
-                className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                disabled={settings.loop_playlist}
-              >
-                <option value="">Nenhuma (finalizar automaticamente)</option>
-                {playlists.filter(p => p.id.toString() !== settings.playlist_id).map((playlist) => (
-                  <option key={playlist.id} value={playlist.id}>
-                    {playlist.nome} ({playlist.total_videos || 0} vídeos)
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-gray-500 mt-1">
-                {settings.loop_playlist 
-                  ? 'Desabilitado quando loop está ativo'
-                  : 'Playlist que será reproduzida após o término da playlist principal'
-                }
-              </p>
-            </div>
-
-            {/* Configurações de Logo */}
-            {settings.logo_id && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 p-4 bg-gray-50 rounded-lg">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Posição da Logo
-                  </label>
-                  <select
-                    value={settings.logo_position}
-                    onChange={(e) => setSettings(prev => ({ ...prev, logo_position: e.target.value as any }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  >
-                    <option value="top-left">Superior Esquerda</option>
-                    <option value="top-right">Superior Direita</option>
-                    <option value="bottom-left">Inferior Esquerda</option>
-                    <option value="bottom-right">Inferior Direita</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Opacidade ({settings.logo_opacity}%)
-                  </label>
-                  <input
-                    type="range"
-                    min="10"
-                    max="100"
-                    value={settings.logo_opacity}
-                    onChange={(e) => setSettings(prev => ({ ...prev, logo_opacity: parseInt(e.target.value) }))}
-                    className="w-full"
-                  />
-                </div>
-
-                <div className="flex items-end">
-                  <button
-                    onClick={() => setShowLogoUpload(true)}
-                    className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 flex items-center"
-                  >
-                    <Upload className="h-4 w-4 mr-2" />
-                    Nova Logo
-                  </button>
-                </div>
-              </div>
-            )}
+      {/* Informações sobre o sistema */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
+        <div className="flex items-start">
+          <AlertCircle className="h-5 w-5 text-blue-600 mr-3 mt-0.5" />
+          <div>
+            <h3 className="text-blue-900 font-medium mb-2">Sistema de Transmissão para Redes Sociais</h3>
+            <ul className="text-blue-800 text-sm space-y-1">
+              <li>• <strong>Domínio Wowza:</strong> https://stmv1.udicast.com (sempre usar este domínio)</li>
+              <li>• <strong>Fonte RTMP:</strong> rtmp://stmv1.udicast.com:1935/{userLogin}/{userLogin}</li>
+              <li>• <strong>Plataformas suportadas:</strong> YouTube, Facebook, Twitch, TikTok, Kwai, Steam, Vimeo, Periscope</li>
+              <li>• <strong>Tempo máximo:</strong> 24 horas por transmissão</li>
+              <li>• <strong>Tecnologia:</strong> FFmpeg + Screen para transmissões contínuas</li>
+              <li>• <strong>Configuração:</strong> Obtenha servidor e chave na conta da rede social escolhida</li>
+            </ul>
           </div>
         </div>
-      )}
-      {/* Debug de Plataformas Configuradas */}
-      {userPlatforms.length > 0 && (
-        <div className="bg-gray-50 rounded-lg shadow-sm p-6">
-          <h2 className="text-xl font-semibold text-gray-800 mb-4">Debug - Plataformas Configuradas</h2>
+      </div>
+
+      {/* Transmissões Ativas */}
+      {hasActiveLive && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-6">
+          <h2 className="text-lg font-semibold text-red-800 mb-4 flex items-center">
+            <div className="h-3 w-3 bg-red-500 rounded-full animate-pulse mr-3"></div>
+            TRANSMISSÕES ATIVAS
+          </h2>
+          
           <div className="space-y-3">
-            {userPlatforms.map((platform) => (
-              <div key={platform.id} className="bg-white p-3 rounded border">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm">
+            {activeLiveTransmissions.map((live) => (
+              <div key={live.id} className="bg-white p-4 rounded-lg border border-red-200">
+                <div className="flex items-center justify-between">
                   <div>
-                    <strong>Plataforma:</strong> {platform.platform.nome}
+                    <h3 className="font-medium text-gray-900 capitalize">{live.tipo}</h3>
+                    <p className="text-sm text-gray-600">
+                      Iniciado: {formatDateTime(live.data_inicio)} • 
+                      Duração: {calculateDuration(live)}
+                    </p>
+                    <p className="text-xs text-gray-500 font-mono">
+                      {live.live_servidor}/{live.live_chave.substring(0, 10)}...
+                    </p>
                   </div>
-                  <div>
-                    <strong>RTMP URL:</strong> {platform.rtmp_url || platform.platform.rtmp_base_url || 'NÃO CONFIGURADO'}
-                  </div>
-                  <div>
-                    <strong>Stream Key:</strong> {platform.stream_key ? '✅ CONFIGURADO' : '❌ NÃO CONFIGURADO'}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Plataformas Configuradas */}
-      <div className="bg-white rounded-lg shadow-sm p-6">
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-xl font-semibold text-gray-800">Plataformas de Transmissão</h2>
-          <button
-            onClick={() => setShowPlatformModal(true)}
-            className="bg-primary-600 text-white px-4 py-2 rounded-md hover:bg-primary-700 flex items-center"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            Adicionar Plataforma
-          </button>
-        </div>
-
-        {userPlatforms.length === 0 ? (
-          <div className="text-center py-8 text-gray-500">
-            <Radio className="h-12 w-12 mx-auto mb-4 text-gray-300" />
-            <p>Nenhuma plataforma configurada</p>
-            <p className="text-sm">Adicione plataformas para transmitir simultaneamente</p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {userPlatforms.map((userPlatform) => (
-              <div
-                key={userPlatform.id}
-                className={`border rounded-lg p-4 cursor-pointer transition-all ${settings.platform_ids.includes(userPlatform.id.toString())
-                    ? 'border-primary-500 bg-primary-50'
-                    : 'border-gray-200 hover:border-gray-300'
-                  } ${isTransmissionActive ? 'opacity-50 cursor-not-allowed' : ''}`}
-                onClick={() => !isTransmissionActive && togglePlatformSelection(userPlatform.id.toString())}
-              >
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="font-medium text-gray-900">{userPlatform.platform.nome}</h3>
                   <div className="flex items-center space-x-2">
-                    {settings.platform_ids.includes(userPlatform.id.toString()) && (
-                      <CheckCircle className="h-5 w-5 text-primary-600" />
-                    )}
                     <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRemovePlatform(userPlatform.id);
+                      onClick={() => {
+                        const streamUrl = `http://stmv1.udicast.com:1935/${userLogin}/${userLogin}/playlist.m3u8`;
+                        setPlayerUrl(streamUrl);
+                        setShowPlayerModal(true);
                       }}
-                      className="text-red-600 hover:text-red-800"
-                      title="Remover plataforma"
+                      className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700"
                     >
-                      <Trash2 className="h-4 w-4" />
+                      <Eye className="h-3 w-3 mr-1" />
+                      Visualizar
+                    </button>
+                    <button
+                      onClick={() => handleStopLiveTransmission(live.id)}
+                      className="bg-red-600 text-white px-3 py-1 rounded text-sm hover:bg-red-700"
+                    >
+                      <Square className="h-3 w-3 mr-1" />
+                      Finalizar
                     </button>
                   </div>
                 </div>
-
-                <div className="text-sm text-gray-600 space-y-1">
-                  <p><strong>Stream Key:</strong> {userPlatform.stream_key.substring(0, 10)}...</p>
-                  <p><strong>RTMP URL:</strong> {(userPlatform.rtmp_url || userPlatform.platform.rtmp_base_url || '').substring(0, 30)}...</p>
-                  {userPlatform.titulo_padrao && (
-                    <p><strong>Título:</strong> {userPlatform.titulo_padrao}</p>
-                  )}
-                  <p className={`text-xs px-2 py-1 rounded ${userPlatform.ativo ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
-                    }`}>
-                    {userPlatform.ativo ? 'Ativa' : 'Inativa'}
-                  </p>
-                </div>
               </div>
             ))}
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Botão de Iniciar Transmissão */}
-        {!isTransmissionActive && userPlatforms.length > 0 && (
-          <div className="mt-6 flex justify-center">
-            <button
-              onClick={handleStartTransmission}
-              disabled={loading || !settings.titulo || !settings.playlist_id || settings.platform_ids.length === 0}
-              className="bg-green-600 text-white px-8 py-3 rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center text-lg font-medium"
-            >
-              <Play className="h-6 w-6 mr-3" />
-              {loading ? 'Iniciando...' : 'Iniciar Transmissão'}
-            </button>
-          </div>
-        )}
+      {/* Lista de Transmissões */}
+      <div className="bg-white rounded-lg shadow-sm p-6">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-xl font-semibold text-gray-800">Transmissões</h2>
+          <button
+            onClick={() => setShowLiveModal(true)}
+            className="bg-primary-600 text-white px-4 py-2 rounded-md hover:bg-primary-700 flex items-center"
+          >
+            <Plus className="h-4 w-4 mr-2" />
+            Nova Transmissão
+          </button>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse">
+            <thead>
+              <tr className="border-b border-gray-200">
+                <th className="text-left py-3 px-4 font-medium text-gray-700">Live</th>
+                <th className="text-left py-3 px-4 font-medium text-gray-700">Início</th>
+                <th className="text-left py-3 px-4 font-medium text-gray-700">Fim</th>
+                <th className="text-left py-3 px-4 font-medium text-gray-700">Duração</th>
+                <th className="text-left py-3 px-4 font-medium text-gray-700">Status</th>
+                <th className="text-center py-3 px-4 font-medium text-gray-700">Ações</th>
+              </tr>
+            </thead>
+            <tbody>
+              {liveTransmissions.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-8 text-center text-gray-500">
+                    Nenhuma transmissão configurada
+                  </td>
+                </tr>
+              ) : (
+                liveTransmissions.map((live) => (
+                  <tr key={live.id} className="border-b border-gray-100 hover:bg-gray-50">
+                    <td className="py-3 px-4">
+                      <div className="flex items-center space-x-2">
+                        <Radio className="h-4 w-4 text-blue-600" />
+                        <span className="font-medium capitalize">{live.tipo}</span>
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 text-sm text-gray-600">
+                      {formatDateTime(live.data_inicio)}
+                    </td>
+                    <td className="py-3 px-4 text-sm text-gray-600">
+                      {formatDateTime(live.data_fim)}
+                    </td>
+                    <td className="py-3 px-4 text-sm text-gray-600">
+                      {calculateDuration(live)}
+                    </td>
+                    <td className="py-3 px-4">
+                      <span className={`px-2 py-1 text-xs font-medium rounded-full ${getStatusColor(live.status)}`}>
+                        {getStatusText(live.status)}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      <div className="flex justify-center space-x-2">
+                        {live.status === '1' && (
+                          <>
+                            <button
+                              onClick={() => {
+                                const streamUrl = `http://stmv1.udicast.com:1935/${userLogin}/${userLogin}/playlist.m3u8`;
+                                setPlayerUrl(streamUrl);
+                                setShowPlayerModal(true);
+                              }}
+                              className="text-blue-600 hover:text-blue-800 p-1"
+                              title="Visualizar transmissão"
+                            >
+                              <Eye className="h-4 w-4" />
+                            </button>
+                            <button
+                              onClick={() => handleStopLiveTransmission(live.id)}
+                              className="text-red-600 hover:text-red-800 p-1"
+                              title="Finalizar transmissão"
+                            >
+                              <Square className="h-4 w-4" />
+                            </button>
+                          </>
+                        )}
+                        
+                        {(live.tipo !== 'facebook' && live.tipo !== 'tiktok' && live.tipo !== 'kwai') && (
+                          <button
+                            onClick={() => handleRestartLiveTransmission(live.id)}
+                            className="text-green-600 hover:text-green-800 p-1"
+                            title="Reiniciar transmissão"
+                          >
+                            <RefreshCw className="h-4 w-4" />
+                          </button>
+                        )}
+                        
+                        <button
+                          onClick={() => handleRemoveLiveTransmission(live.id)}
+                          className="text-red-600 hover:text-red-800 p-1"
+                          title="Remover transmissão"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      {/* Modal de Configuração de Plataforma */}
-      {showPlatformModal && (
+      {/* Modal de Nova Transmissão */}
+      {showLiveModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="p-6 border-b border-gray-200">
               <div className="flex justify-between items-center">
-                <h3 className="text-lg font-semibold">Configurar Plataforma</h3>
+                <h3 className="text-lg font-semibold">Cadastrar Live</h3>
                 <button
-                  onClick={() => setShowPlatformModal(false)}
+                  onClick={() => setShowLiveModal(false)}
                   className="text-gray-400 hover:text-gray-600"
                 >
                   ×
@@ -880,18 +620,25 @@ const IniciarTransmissao: React.FC = () => {
               </div>
             </div>
 
+            <div className="p-4 bg-yellow-50 border-b border-yellow-200">
+              <div className="flex items-start">
+                <AlertCircle className="h-4 w-4 text-yellow-600 mr-2 mt-0.5" />
+                <p className="text-yellow-800 text-sm">
+                  O servidor e chave devem ser obtidos na conta da rede social escolhida. 
+                  Tempo máximo de transmissão é 24 horas.
+                </p>
+              </div>
+            </div>
+
             <div className="p-6 space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Plataforma *
-                </label>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Live</label>
                 <select
-                  value={platformForm.platform_id}
-                  onChange={(e) => setPlatformForm(prev => ({ ...prev, platform_id: e.target.value }))}
+                  value={liveSettings.tipo}
+                  onChange={(e) => handlePlatformChange(e.target.value)}
                   className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
                 >
-                  <option value="">Selecione uma plataforma</option>
-                  {platforms.map((platform) => (
+                  {availablePlatforms.map((platform) => (
                     <option key={platform.id} value={platform.id}>
                       {platform.nome}
                     </option>
@@ -901,82 +648,210 @@ const IniciarTransmissao: React.FC = () => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Chave de Transmissão (Stream Key) *
+                  Servidor RTMP *
                 </label>
                 <input
                   type="text"
-                  value={platformForm.stream_key}
-                  onChange={(e) => setPlatformForm(prev => ({ ...prev, stream_key: e.target.value }))}
+                  value={liveSettings.live_servidor}
+                  onChange={(e) => setLiveSettings(prev => ({ ...prev, live_servidor: e.target.value }))}
                   className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder="Cole aqui a stream key da plataforma"
+                  placeholder="rtmp://servidor.com/live"
                 />
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  URL RTMP (Opcional)
+                  Chave/Key *
                 </label>
                 <input
                   type="text"
-                  value={platformForm.rtmp_url}
-                  onChange={(e) => setPlatformForm(prev => ({ ...prev, rtmp_url: e.target.value }))}
+                  value={liveSettings.live_chave}
+                  onChange={(e) => setLiveSettings(prev => ({ ...prev, live_chave: e.target.value }))}
                   className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder="URL RTMP personalizada (deixe vazio para usar padrão da plataforma)"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Se não preenchido, será usado o RTMP padrão da plataforma selecionada
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Título Padrão
-                </label>
-                <input
-                  type="text"
-                  value={platformForm.titulo_padrao}
-                  onChange={(e) => setPlatformForm(prev => ({ ...prev, titulo_padrao: e.target.value }))}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder="Título padrão para esta plataforma"
+                  placeholder="Chave de transmissão da plataforma"
                 />
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Descrição Padrão
+                <label className="flex items-center">
+                  <input
+                    type="checkbox"
+                    checked={liveSettings.inicio_imediato}
+                    onChange={(e) => setLiveSettings(prev => ({ ...prev, inicio_imediato: e.target.checked }))}
+                    className="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded"
+                  />
+                  <span className="ml-3 text-sm text-gray-700">Iniciar Imediatamente</span>
                 </label>
-                <textarea
-                  value={platformForm.descricao_padrao}
-                  onChange={(e) => setPlatformForm(prev => ({ ...prev, descricao_padrao: e.target.value }))}
-                  rows={3}
-                  className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
-                  placeholder="Descrição padrão para esta plataforma"
-                />
               </div>
+
+              {!liveSettings.inicio_imediato && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Data de Início *
+                    </label>
+                    <input
+                      type="datetime-local"
+                      value={liveSettings.data_inicio}
+                      onChange={(e) => setLiveSettings(prev => ({ ...prev, data_inicio: e.target.value }))}
+                      className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Data de Término *
+                    </label>
+                    <input
+                      type="datetime-local"
+                      value={liveSettings.data_fim}
+                      onChange={(e) => setLiveSettings(prev => ({ ...prev, data_fim: e.target.value }))}
+                      className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-primary-500 focus:border-primary-500"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="p-6 border-t border-gray-200 flex justify-end space-x-3">
               <button
-                onClick={() => setShowPlatformModal(false)}
+                onClick={() => setShowLiveModal(false)}
                 className="px-4 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400"
               >
                 Cancelar
               </button>
               <button
-                onClick={handleConfigurePlatform}
-                className="px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700"
+                onClick={handleStartLiveTransmission}
+                disabled={loading || !liveSettings.live_chave}
+                className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 flex items-center"
               >
-                Salvar Plataforma
+                <Radio className="h-4 w-4 mr-2" />
+                {loading ? 'Configurando...' : liveSettings.inicio_imediato ? 'Iniciar Live' : 'Agendar Live'}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Modal de Upload de Logo */}
-      {showLogoUpload && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg max-w-md w-full">
+      {/* Modal do Player */}
+      {showPlayerModal && playerUrl && (
+        <div className="fixed inset-0 bg-black bg-opacity-95 flex items-center justify-center z-50 p-4">
+          <div className="bg-black rounded-lg relative max-w-6xl w-full h-[80vh]">
+            {/* Controles do Modal */}
+            <div className="absolute top-4 right-4 z-20 flex items-center space-x-2">
+              <button
+                onClick={() => window.open(playerUrl, '_blank')}
+                className="text-white bg-blue-600 hover:bg-blue-700 rounded-full p-3 transition-colors duration-200 shadow-lg"
+                title="Abrir em nova aba"
+              >
+                <ExternalLink size={20} />
+              </button>
+              
+              <button
+                onClick={() => setShowPlayerModal(false)}
+                className="text-white bg-red-600 hover:bg-red-700 rounded-full p-3 transition-colors duration-200 shadow-lg"
+                title="Fechar player"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Título da Transmissão */}
+            <div className="absolute top-4 left-4 z-20 bg-black bg-opacity-60 text-white px-4 py-2 rounded-lg">
+              <h3 className="font-medium">📺 Transmissão ao Vivo</h3>
+              <p className="text-xs opacity-80">
+                URL: http://stmv1.udicast.com:1935/{userLogin}/{userLogin}/playlist.m3u8
+              </p>
+            </div>
+
+            {/* Player */}
+            <div className="w-full h-full p-4 pt-16">
+              <IFrameVideoPlayer
+                src={playerUrl}
+                title="Transmissão ao Vivo"
+                isLive={true}
+                autoplay={true}
+                controls={true}
+                className="w-full h-full"
+                onError={(error) => {
+                  console.error('Erro no player de transmissão:', error);
+                  toast.error('Erro ao carregar transmissão');
+                }}
+                onReady={() => {
+                  console.log('Player de transmissão pronto');
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Informações Técnicas */}
+      <div className="bg-white rounded-lg shadow-sm p-6">
+        <h2 className="text-xl font-semibold text-gray-800 mb-4">Informações de Transmissão</h2>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div>
+            <h3 className="text-sm font-medium text-gray-500 mb-2">Fonte RTMP (Seu Stream)</h3>
+            <div className="bg-gray-100 p-3 rounded-md">
+              <p className="font-mono text-sm">
+                rtmp://stmv1.udicast.com:1935/{userLogin}/{userLogin}
+              </p>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              Este é o stream que será capturado e retransmitido
+            </p>
+          </div>
+
+          <div>
+            <h3 className="text-sm font-medium text-gray-500 mb-2">URL de Visualização (HLS)</h3>
+            <div className="bg-gray-100 p-3 rounded-md">
+              <p className="font-mono text-sm">
+                http://stmv1.udicast.com:1935/{userLogin}/{userLogin}/playlist.m3u8
+              </p>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              URL para visualizar sua transmissão
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-md">
+          <h4 className="text-blue-900 font-medium mb-2">🔧 Como Funciona</h4>
+          <ul className="text-blue-800 text-sm space-y-1">
+            <li>• <strong>Captura:</strong> FFmpeg captura seu stream RTMP local</li>
+            <li>• <strong>Retransmissão:</strong> Envia para a plataforma escolhida (YouTube, Facebook, etc.)</li>
+            <li>• <strong>Configuração especial:</strong> TikTok e Kwai usam crop 9:16 e configurações otimizadas</li>
+            <li>• <strong>Facebook:</strong> Usa RTMPS (SSL) na porta 443</li>
+            <li>• <strong>Monitoramento:</strong> Sistema verifica se processo FFmpeg está rodando</li>
+            <li>• <strong>Screen:</strong> Usa GNU Screen para manter processo em background</li>
+          </ul>
+        </div>
+      </div>
+
+      {/* Aviso importante */}
+      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
+        <div className="flex items-start">
+          <AlertCircle className="h-5 w-5 text-yellow-600 mr-3 mt-0.5" />
+          <div>
+            <h3 className="text-yellow-900 font-medium mb-2">⚠️ Instruções Importantes</h3>
+            <ul className="text-yellow-800 text-sm space-y-1">
+              <li>• <strong>Não é necessário deixar esta página aberta</strong> após iniciar a transmissão</li>
+              <li>• Verifique o sinal no canal escolhido antes de iniciar</li>
+              <li>• Inicie a transmissão no OBS ou software de streaming após configurar aqui</li>
+              <li>• Para <strong>TikTok e Kwai:</strong> O sistema aplicará automaticamente crop 9:16</li>
+              <li>• Para <strong>Facebook:</strong> Certifique-se de que sua conta permite transmissões ao vivo</li>
+              <li>• <strong>Limite de tempo:</strong> Máximo 24 horas por transmissão</li>
+              <li>• <strong>Reiniciar:</strong> Disponível apenas para YouTube, Twitch, Vimeo, Steam e RTMP próprio</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default IniciarTransmissao;
             <div className="p-6 border-b border-gray-200">
               <div className="flex justify-between items-center">
                 <h3 className="text-lg font-semibold">Upload de Logo</h3>

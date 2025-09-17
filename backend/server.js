@@ -346,6 +346,40 @@ app.use('/api/dados-conexao', dadosConexaoRoutes);
 app.use('/api/player-external', playerExternalRoutes);
 app.use('/api/player-port', playerPortRoutes);
 
+// Middleware para verificar se tabela lives existe
+app.use('/api/streaming/lives', async (req, res, next) => {
+  try {
+    // Verificar se tabela lives existe
+    await db.execute('DESCRIBE lives');
+    next();
+  } catch (error) {
+    // Tabela não existe, criar
+    try {
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS lives (
+          codigo INT AUTO_INCREMENT PRIMARY KEY,
+          codigo_stm INT NOT NULL,
+          data_inicio DATETIME,
+          data_fim DATETIME,
+          tipo VARCHAR(50) NOT NULL,
+          live_servidor VARCHAR(255) NOT NULL,
+          live_app VARCHAR(255),
+          live_chave VARCHAR(255) NOT NULL,
+          status ENUM('0','1','2','3') DEFAULT '2',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_codigo_stm (codigo_stm),
+          INDEX idx_status (status)
+        )
+      `);
+      console.log('✅ Tabela lives criada com sucesso');
+      next();
+    } catch (createError) {
+      console.error('Erro ao criar tabela lives:', createError);
+      res.status(500).json({ error: 'Erro ao inicializar tabela de transmissões' });
+    }
+  }
+});
+
 app.get('/api/test', (req, res) => res.json({ message: 'API funcionando!', timestamp: new Date().toISOString() }));
 
 app.get('/api/health', async (req, res) => {
